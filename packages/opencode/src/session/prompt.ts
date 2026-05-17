@@ -55,6 +55,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionEvent } from "@opencode-ai/core/session-event"
+import { SkillTool } from "@/tool/skill"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AgentAttachment, FileAttachment, ReferenceAttachment, Source } from "@opencode-ai/core/session-prompt"
@@ -1887,6 +1888,165 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
+    const skillCommand = Effect.fn("SessionPrompt.command.skill")(function* (input: CommandInput, agent: Agent.Info) {
+      const ctx = yield* InstanceState.context
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* revert.cleanup(session)
+      yield* sessions.touch(input.sessionID)
+      const modelRef = input.model
+        ? Provider.parseModel(input.model)
+        : (agent.model ?? (yield* currentModel(input.sessionID)))
+      const model = yield* getModel(modelRef.providerID, modelRef.modelID, input.sessionID)
+      const userMsg: MessageV2.User = {
+        id: input.messageID ?? MessageID.ascending(),
+        sessionID: input.sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: agent.name,
+        model: modelRef,
+      }
+      yield* sessions.updateMessage(userMsg)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: userMsg.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: "The following tool was executed by the user",
+        synthetic: true,
+      } satisfies MessageV2.TextPart)
+
+      const assistantMessage: MessageV2.Assistant = {
+        id: MessageID.ascending(),
+        sessionID: input.sessionID,
+        parentID: userMsg.id,
+        mode: agent.name,
+        agent: agent.name,
+        variant: input.variant,
+        cost: 0,
+        path: { cwd: ctx.directory, root: ctx.worktree },
+        time: { created: Date.now() },
+        role: "assistant",
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: model.id,
+        providerID: model.providerID,
+      }
+      yield* sessions.updateMessage(assistantMessage)
+
+      let part: MessageV2.ToolPart = yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: assistantMessage.id,
+        sessionID: input.sessionID,
+        type: "tool",
+        tool: SkillTool.id,
+        callID: ulid(),
+        state: {
+          status: "running",
+          time: { start: Date.now() },
+          input: { name: input.command },
+        },
+      } satisfies MessageV2.ToolPart)
+
+      const skillTool = (yield* registry.all()).find((tool) => tool.id === SkillTool.id)
+      if (!skillTool) throw new Error("Skill tool not found")
+
+      const args = { name: input.command }
+      yield* plugin.trigger(
+        "tool.execute.before",
+        { tool: SkillTool.id, sessionID: input.sessionID, callID: part.callID },
+        { args },
+      )
+      const result = yield* skillTool
+        .execute(args, {
+          agent: agent.name,
+          messageID: assistantMessage.id,
+          sessionID: input.sessionID,
+          abort: AbortSignal.any([]),
+          callID: part.callID,
+          extra: {},
+          messages: yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie),
+          metadata: (val) =>
+            Effect.gen(function* () {
+              if (part.state.status !== "running") return
+              part = yield* sessions.updatePart({
+                ...part,
+                state: {
+                  ...part.state,
+                  title: val.title,
+                  metadata: val.metadata,
+                },
+              } satisfies MessageV2.ToolPart)
+            }),
+          ask: (req) =>
+            permission
+              .ask({
+                ...req,
+                sessionID: input.sessionID,
+                tool: { messageID: assistantMessage.id, callID: part.callID },
+                ruleset: Permission.merge(agent.permission, session.permission ?? []),
+              })
+              .pipe(Effect.orDie),
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              const error = Cause.squash(cause)
+              assistantMessage.finish = "tool-calls"
+              assistantMessage.time.completed = Date.now()
+              yield* sessions.updateMessage(assistantMessage)
+              yield* sessions.updatePart({
+                ...part,
+                state: {
+                  status: "error",
+                  input: part.state.input,
+                  error: error instanceof Error ? error.message : String(error),
+                  time: {
+                    start: part.state.status === "running" ? part.state.time.start : Date.now(),
+                    end: Date.now(),
+                  },
+                  metadata: part.state.status === "running" ? part.state.metadata : undefined,
+                },
+              } satisfies MessageV2.ToolPart)
+              return yield* Effect.failCause(cause)
+            }),
+          ),
+        )
+
+      yield* plugin.trigger(
+        "tool.execute.after",
+        { tool: SkillTool.id, sessionID: input.sessionID, callID: part.callID, args },
+        result,
+      )
+      assistantMessage.finish = "tool-calls"
+      assistantMessage.time.completed = Date.now()
+      yield* sessions.updateMessage(assistantMessage)
+      part = yield* sessions.updatePart({
+        ...part,
+        state: {
+          status: "completed",
+          input: part.state.input,
+          title: result.title,
+          metadata: result.metadata,
+          output: result.output,
+          attachments: result.attachments?.map((attachment) => ({
+            ...attachment,
+            id: PartID.ascending(),
+            sessionID: input.sessionID,
+            messageID: assistantMessage.id,
+          })),
+          time: { start: part.state.status === "running" ? part.state.time.start : Date.now(), end: Date.now() },
+        },
+      } satisfies MessageV2.ToolPart)
+
+      if (!input.arguments.trim()) return { info: assistantMessage, parts: [part] }
+      return yield* prompt({
+        sessionID: input.sessionID,
+        agent: agent.name,
+        model: modelRef,
+        parts: [{ type: "text", text: input.arguments }],
+        variant: input.variant,
+      })
+    })
+
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })
       const cmd = yield* commands.get(input.command)
@@ -1898,6 +2058,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         throw error
       }
       const agentName = cmd.agent ?? input.agent
+
+      if (cmd.source === "skill") {
+        const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+        if (!agent) {
+          const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+          const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+          const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
+          yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+          throw error
+        }
+        const result = yield* skillCommand(input, agent)
+        yield* bus.publish(Command.Event.Executed, {
+          name: input.command,
+          sessionID: input.sessionID,
+          arguments: input.arguments,
+          messageID: result.info.id,
+        })
+        return result
+      }
 
       const raw = input.arguments.match(argsRegex) ?? []
       const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))

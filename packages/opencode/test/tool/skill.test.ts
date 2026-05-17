@@ -88,6 +88,85 @@ Use this skill.
           expect(result.output).toContain(`<skill_content name="tool-skill">`)
           expect(result.output).toContain(`Base directory for this skill: ${pathToFileURL(skill).href}`)
           expect(result.output).toContain(`<file>${file}</file>`)
+
+          const loaded = yield* tool.execute(
+            { name: "tool-skill" },
+            {
+              ...ctx,
+              messages: [
+                {
+                  info: {
+                    id: MessageID.make("msg_loaded"),
+                    parentID: MessageID.make("msg_parent"),
+                    sessionID: SessionID.make("ses_test"),
+                    role: "assistant",
+                    time: { created: Date.now() },
+                    mode: "build",
+                    agent: "build",
+                    path: { cwd: dir, root: dir },
+                    cost: 0,
+                    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                    modelID: "gpt-5" as any,
+                    providerID: "opencode" as any,
+                  },
+                  parts: [
+                    {
+                      id: "prt_loaded" as any,
+                      messageID: MessageID.make("msg_loaded"),
+                      sessionID: SessionID.make("ses_test"),
+                      type: "tool",
+                      tool: SkillTool.id,
+                      callID: "call_loaded",
+                      state: {
+                        status: "completed",
+                        input: { name: "tool-skill" },
+                        title: result.title,
+                        metadata: result.metadata,
+                        output: result.output,
+                        time: { start: Date.now(), end: Date.now() },
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          )
+
+          expect(requests.length).toBe(1)
+          expect(loaded.metadata.alreadyLoaded).toBe(true)
+          expect(loaded.output).toContain(`already_loaded="true"`)
+          expect(loaded.output).not.toContain("Use this skill.")
+
+          const textLoaded = yield* tool.execute(
+            { name: "tool-skill" },
+            {
+              ...ctx,
+              messages: [
+                {
+                  info: {
+                    id: MessageID.make("msg_text_loaded"),
+                    sessionID: SessionID.make("ses_test"),
+                    role: "user",
+                    time: { created: Date.now() },
+                    agent: "build",
+                    model: { providerID: "opencode" as any, modelID: "gpt-5" as any },
+                  },
+                  parts: [
+                    {
+                      id: "prt_text_loaded" as any,
+                      messageID: MessageID.make("msg_text_loaded"),
+                      sessionID: SessionID.make("ses_test"),
+                      type: "text",
+                      text: "# Tool Skill\n\nUse this skill.",
+                    },
+                  ],
+                },
+              ],
+            },
+          )
+
+          expect(requests.length).toBe(1)
+          expect(textLoaded.metadata.alreadyLoaded).toBe(true)
         }),
       { git: true },
     ),

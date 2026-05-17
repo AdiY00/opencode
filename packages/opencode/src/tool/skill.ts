@@ -29,6 +29,22 @@ export const SkillTool = Tool.define(
             throw new Error(`Skill "${params.name}" not found. Available skills: ${available || "none"}`)
           }
 
+          if (isLoaded(ctx.messages, params.name, info.content)) {
+            return {
+              title: `Loaded skill: ${info.name}`,
+              output: [
+                `<skill_content name="${info.name}" already_loaded="true">`,
+                `Skill "${info.name}" is already loaded in this conversation. Use the existing skill instructions.`,
+                "</skill_content>",
+              ].join("\n"),
+              metadata: {
+                name: info.name,
+                dir: path.dirname(info.location),
+                alreadyLoaded: true,
+              },
+            }
+          }
+
           yield* ctx.ask({
             permission: "skill",
             patterns: [params.name],
@@ -67,9 +83,23 @@ export const SkillTool = Tool.define(
             metadata: {
               name: info.name,
               dir,
+              alreadyLoaded: false,
             },
           }
         }).pipe(Effect.orDie),
     }
   }),
 )
+
+function isLoaded(messages: Tool.Context["messages"], name: string, content: string) {
+  const text = content.trim()
+  return messages.some((message) =>
+    message.parts.some((part) => {
+      if (part.type === "text") return text !== "" && part.text.includes(text)
+      if (part.type !== "tool") return false
+      if (part.tool !== SkillTool.id) return false
+      if (part.state.status !== "completed") return false
+      return part.state.metadata.name === name && part.state.metadata.alreadyLoaded !== true
+    }),
+  )
+}

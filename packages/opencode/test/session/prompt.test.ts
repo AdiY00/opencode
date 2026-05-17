@@ -41,6 +41,7 @@ import { SystemPrompt } from "../../src/session/system"
 import { Shell } from "../../src/shell/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
+import { SkillTool } from "@/tool/skill"
 import { Truncate } from "@/tool/truncate"
 import * as Log from "@opencode-ai/core/util/log"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -1570,6 +1571,83 @@ unix(
         expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("configured")
       }),
     ),
+  { git: true },
+  30_000,
+)
+
+it.instance(
+  "skill command records a completed skill tool result",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      yield* writeText(
+        path.join(dir, ".opencode", "skill", "cmd-skill", "SKILL.md"),
+        ["---", "name: cmd-skill", "description: Skill command test.", "---", "", "Use command skill."].join("\n"),
+      )
+      yield* writeText(path.join(dir, ".opencode", "skill", "cmd-skill", "scripts", "demo.txt"), "demo")
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        permission: [{ permission: "skill", pattern: "*", action: "allow" }],
+      })
+
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cmd-skill",
+        arguments: "",
+      })
+
+      expect(result.info.role).toBe("assistant")
+      const part = completedTool(result.parts)
+      expect(part?.tool).toBe(SkillTool.id)
+      expect(part?.state.input).toEqual({ name: "cmd-skill" })
+      expect(part?.state.metadata.name).toBe("cmd-skill")
+      expect(part?.state.output).toContain(`<skill_content name="cmd-skill">`)
+      expect(part?.state.output).toContain("Use command skill.")
+      expect(part?.state.output).toContain("scripts/demo.txt")
+      expect(yield* llm.calls).toBe(0)
+    }),
+  { git: true },
+  30_000,
+)
+
+it.instance(
+  "skill command with arguments loads skill then prompts with arguments",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      yield* writeText(
+        path.join(dir, ".opencode", "skill", "cmd-skill-args", "SKILL.md"),
+        [
+          "---",
+          "name: cmd-skill-args",
+          "description: Skill command args test.",
+          "---",
+          "",
+          "Use command skill with args.",
+        ].join("\n"),
+      )
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        permission: [{ permission: "skill", pattern: "*", action: "allow" }],
+      })
+      yield* llm.text("done")
+
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cmd-skill-args",
+        arguments: "apply it to this task",
+      })
+
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+      expect(yield* llm.calls).toBeGreaterThan(0)
+      const inputs = yield* llm.inputs
+      expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("Use command skill with args.")
+      expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("apply it to this task")
+      expect(JSON.stringify(inputs.at(-1)?.messages).match(/Use command skill with args\./g)?.length).toBe(1)
+    }),
   { git: true },
   30_000,
 )
